@@ -2,10 +2,11 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+import tensorflow_probability as tfp 
 import cv2
 
-train = [2, 3, 6]
-test = [7]
+train = [2, 6]
+test = [3, 7]
 
 target_size = (256, 256)
 
@@ -73,6 +74,7 @@ def dice_loss(y_true, y_pred):
     denominator = tf.reduce_sum(y_true + y_pred, axis=(1, 2, 3))
     return 1 - (numerator + 1) / (denominator + 1)  # Add smoothing to avoid division by zero
 
+# Define custom layers
 class TopHatLayer(tf.keras.layers.Layer):
     def __init__(self):
         super(TopHatLayer, self).__init__()
@@ -103,48 +105,108 @@ class MultiScaleFocusLayer(tf.keras.layers.Layer):
     def __init__(self, scales):
         super(MultiScaleFocusLayer, self).__init__()
         self.scales = scales
-    
+
     def build(self, input_shape):
-        self.num_scales = len(self.scales)
-        # Initialize weights for each scale
-        self.weights_list = [1 / (2 * j + 1) for j in self.scales]
-    
+        self.conv_layers = []
+        for scale in self.scales:
+            conv_layer = tf.keras.layers.Conv2D(filters=1, kernel_size=1, activation=None, padding='same')
+            self.conv_layers.append(conv_layer)
+
     def call(self, inputs):
-        # Ensure the input shape is compatible
-        if inputs.shape[-1] != self.num_scales:
-            raise ValueError(f"Number of input channels ({inputs.shape[-1]}) does not match the number of scales ({self.num_scales}).")
+        # Perform convolutions at multiple scales and combine using weighted summation
+        multiscale_output = 0
+        for scale, conv_layer in zip(self.scales, self.conv_layers):
+            conv_output = conv_layer(inputs)
+            multiscale_output += conv_output
+        return multiscale_output
+
+class MultiScaleFocusMeasureLayer(tf.keras.layers.Layer):
+    def __init__(self, scales):
+        super(MultiScaleFocusMeasureLayer, self).__init__()
+        self.scales = scales
+
+    def build(self, input_shape):
+        self.conv_layers = []
+        for scale in self.scales:
+            conv_layer = tf.keras.layers.Conv2D(filters=1, kernel_size=scale, activation=None, padding='same')
+            self.conv_layers.append(conv_layer)
+
+    def call(self, inputs):
+        # Perform convolutions at multiple scales and combine using weighted summation
+        multiscale_output = 0
+        for scale, conv_layer in zip(self.scales, self.conv_layers):
+            conv_output = conv_layer(inputs)
+            multiscale_output += conv_output
+        return multiscale_output
+
+class FocusRegionLayer(tf.keras.layers.Layer):
+    def __init__(self, threshold):
+        super(FocusRegionLayer, self).__init__()
+        self.threshold = threshold
+
+    def call(self, inputs):
+        max_value = tf.reduce_max(inputs, axis=-1, keepdims=True)
+        focus_regions = tf.where(inputs > max_value - self.threshold, 1, 0)
+        return focus_regions
+
+class MedianFilterLayer(tf.keras.layers.Layer):
+    def __init__(self, window_size):
+        super(MedianFilterLayer, self).__init__()
+        self.window_size = window_size
+
+    def call(self, inputs):
+        # Prepare the kernel for median filtering
+        kernel_shape = [self.window_size[0], self.window_size[1], 1, 1]
+        kernel = tf.ones(kernel_shape) / (self.window_size[0] * self.window_size[1])
         
-        # Compute focus measurement value D^n_j(x,y) for each scale and take the maximum
-        D_n = None
-        for i, j in enumerate(self.scales):
-            # Compute D^n_j(x,y) for the current scale
-            D_j_n = inputs[..., i] * self.weights_list[i]
-            # Update D_n if it's None or take the maximum
-            D_n = D_j_n if D_n is None else tf.maximum(D_n, D_j_n)
-        
-        return D_n
+        # Apply depthwise convolution for median filtering
+        median_filtered = tf.nn.depthwise_conv2d(inputs, kernel, strides=[1, 1, 1, 1], padding='SAME')
+        return median_filtered
+
+
+class SkeletonExtractionLayer(tf.keras.layers.Layer):
+    def __init__(self, iterations):
+        super(SkeletonExtractionLayer, self).__init__()
+        self.iterations = iterations
+
+    def call(self, inputs):
+        skeleton = tf.keras.morphology.skeletonize(inputs, iterations=self.iterations)
+        return skeleton
+
+class TrimapsLayer(tf.keras.layers.Layer):
+    def call(self, inputs):
+        uncertain_regions = tf.where(tf.logical_and(inputs == 0, tf.reduce_max(inputs, axis=-1) == 1), 0.5, 0)
+        trimaps = tf.where(inputs == 1, 1, uncertain_regions)
+        return trimaps
 
 # Define your neural network model
 model = tf.keras.Sequential([
+    # Input layer specifying the input shape
+    tf.keras.layers.InputLayer(input_shape=(256, 256, 1)),
     # Add layers as needed
     TopHatLayer(),  # Top Hat layer
     BlackHatLayer(),  # Black Hat layer
     tf.keras.layers.Conv2D(filters=64, kernel_size=3, activation='relu', padding='same'),
-    # Add more layers...
+    tf.keras.layers.BatchNormalization(),  # Batch normalization
+    tf.keras.layers.Conv2D(filters=64, kernel_size=3, activation='relu', padding='same'),
+    tf.keras.layers.BatchNormalization(),  # Batch normalization
+    tf.keras.layers.Conv2D(filters=64, kernel_size=3, activation='relu', padding='same'),
+    tf.keras.layers.BatchNormalization(),  # Batch normalization
     tf.keras.layers.Conv2D(filters=3, kernel_size=1, activation='relu', padding='same'),  # Number of channels should match the number of scales
     MultiScaleFocusLayer(scales=[1, 2, 3]),  # Multi-scale focus layer
-    # Add more layers...
-    tf.keras.layers.Conv2D(filters=1, kernel_size=1, activation='sigmoid', padding='same')
+    tf.keras.layers.Conv2D(filters=1, kernel_size=1, activation='sigmoid', padding='same'),
+    MedianFilterLayer(window_size=(3, 3))  # Median filtering layer
 ])
 
 # Compile the model with appropriate loss function
-model.compile(optimizer='adam', loss=dice_loss, metrics=['accuracy'])
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), loss=dice_loss, metrics=['accuracy'])
 
 # Train the model
-model.fit(train_images, train_masks, epochs=10, validation_data=(test_images, test_masks), batch_size=2) # Explicitly set batch size
+history = model.fit(train_images, train_masks, epochs=50, validation_data=(test_images, test_masks), batch_size=2) # Explicitly set batch size
 
-# Evaluate the model on the test dataset
-loss, accuracy = model.evaluate(test_images, test_masks)
+# Retrieve loss and accuracy from training history
+loss = history.history['loss'][-1]
+accuracy = history.history['accuracy'][-1]
 
 print("Test Dice Loss:", loss)
 print("Test Accuracy:", accuracy)
