@@ -161,12 +161,17 @@ class FocusRegionLayer(tf.keras.layers.Layer):
         P_n_d = tf.cast(tf.reduce_max(inputs) - tf.reduce_max(inputs), dtype=tf.float32)
         P_n_d_bool = inputs > self.threshold
         # Combine skeleton and thresholded focus regions
-        R_n_d = tf.math.logical_or(R_n_MS_bool, P_n_d_bool)
+        R_n_d_bool = tf.math.logical_or(R_n_MS_bool, P_n_d_bool)
         # Create trimaps
-        R_n_d = tf.cast(R_n_d, dtype=tf.float32)
-        R_m_d = tf.cast(tf.logical_and(R_n_d, max_focus == 0), dtype=tf.float32)
-        max_focus = tf.reduce_max(R_m_d, axis=-1)
-        T_n = tf.where(R_n_d, tf.where(max_focus, 1.0, 0.5), 0.0)
+        R_n_d = tf.cast(R_n_d_bool, dtype=tf.float32)
+        max_focus = tf.reduce_max(R_n_d, axis=-1)
+        max_focus = tf.expand_dims(max_focus, axis=-1)
+        max_focus = tf.tile(max_focus, multiples=[1, 1, 1, 1])
+        max_focus_bool = max_focus == 0
+        # T_n_0 = tf.where(tf.logical_xor(R_n_d_bool, max_focus_bool)) 
+        # max_focus = tf.logical_and(R_n_d_bool, max_focus_bool)
+        # T_n_0 = tf.logical_xor(R_n_d_bool, max_focus_bool)
+        # T_n = tf.where(R_n_d, tf.where(max_focus, 1.0, 0.5), 0.0)
 
         return median_filtered
 
